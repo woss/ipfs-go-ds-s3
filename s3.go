@@ -2,7 +2,6 @@ package s3ds
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"io"
 	"path"
@@ -105,8 +104,8 @@ func NewS3Datastore(conf Config) (*S3Bucket, error) {
 	}, nil
 }
 
-func (s *S3Bucket) Put(ctx context.Context, k ds.Key, value []byte) error {
-	_, err := s.S3.PutObjectWithContext(ctx, &s3.PutObjectInput{
+func (s *S3Bucket) Put(k ds.Key, value []byte) error {
+	_, err := s.S3.PutObject(&s3.PutObjectInput{
 		Bucket: aws.String(s.Bucket),
 		Key:    aws.String(s.s3Path(k.String())),
 		Body:   bytes.NewReader(value),
@@ -114,12 +113,12 @@ func (s *S3Bucket) Put(ctx context.Context, k ds.Key, value []byte) error {
 	return err
 }
 
-func (s *S3Bucket) Sync(ctx context.Context, prefix ds.Key) error {
+func (s *S3Bucket) Sync(prefix ds.Key) error {
 	return nil
 }
 
-func (s *S3Bucket) Get(ctx context.Context, k ds.Key) ([]byte, error) {
-	resp, err := s.S3.GetObjectWithContext(ctx, &s3.GetObjectInput{
+func (s *S3Bucket) Get(k ds.Key) ([]byte, error) {
+	resp, err := s.S3.GetObject(&s3.GetObjectInput{
 		Bucket: aws.String(s.Bucket),
 		Key:    aws.String(s.s3Path(k.String())),
 	})
@@ -134,8 +133,8 @@ func (s *S3Bucket) Get(ctx context.Context, k ds.Key) ([]byte, error) {
 	return io.ReadAll(resp.Body)
 }
 
-func (s *S3Bucket) Has(ctx context.Context, k ds.Key) (exists bool, err error) {
-	_, err = s.GetSize(ctx, k)
+func (s *S3Bucket) Has(k ds.Key) (exists bool, err error) {
+	_, err = s.GetSize(k)
 	if err != nil {
 		if err == ds.ErrNotFound {
 			return false, nil
@@ -145,8 +144,8 @@ func (s *S3Bucket) Has(ctx context.Context, k ds.Key) (exists bool, err error) {
 	return true, nil
 }
 
-func (s *S3Bucket) GetSize(ctx context.Context, k ds.Key) (size int, err error) {
-	resp, err := s.S3.HeadObjectWithContext(ctx, &s3.HeadObjectInput{
+func (s *S3Bucket) GetSize(k ds.Key) (size int, err error) {
+	resp, err := s.S3.HeadObject(&s3.HeadObjectInput{
 		Bucket: aws.String(s.Bucket),
 		Key:    aws.String(s.s3Path(k.String())),
 	})
@@ -159,8 +158,8 @@ func (s *S3Bucket) GetSize(ctx context.Context, k ds.Key) (size int, err error) 
 	return int(*resp.ContentLength), nil
 }
 
-func (s *S3Bucket) Delete(ctx context.Context, k ds.Key) error {
-	_, err := s.S3.DeleteObjectWithContext(ctx, &s3.DeleteObjectInput{
+func (s *S3Bucket) Delete(k ds.Key) error {
+	_, err := s.S3.DeleteObject(&s3.DeleteObjectInput{
 		Bucket: aws.String(s.Bucket),
 		Key:    aws.String(s.s3Path(k.String())),
 	})
@@ -171,23 +170,64 @@ func (s *S3Bucket) Delete(ctx context.Context, k ds.Key) error {
 	return err
 }
 
-func (s *S3Bucket) Query(ctx context.Context, q dsq.Query) (dsq.Results, error) {
-	if q.Orders != nil || q.Filters != nil {
-		return nil, fmt.Errorf("s3ds: filters or orders are not supported")
+func querySupported(q dsq.Query) bool {
+	if len(q.Orders) > 0 {
+		switch q.Orders[0].(type) {
+		case dsq.OrderByKey, *dsq.OrderByKey:
+			// We order by key by default.
+		default:
+			return false
+		}
+	}
+	return len(q.Filters) == 0
+}
+
+func (s *S3Bucket) Query(q dsq.Query) (dsq.Results, error) {
+	// Handle ordering
+	if !querySupported(q) {
+		// OK, time to do this the naive way.
+
+		// Skip the stuff we can't apply.
+		baseQuery := q
+		baseQuery.Filters = nil
+		baseQuery.Orders = nil
+		baseQuery.Limit = 0  // needs to apply after we order
+		baseQuery.Offset = 0 // ditto.
+
+		// perform the base query.
+		res, err := s.Query(baseQuery)
+		if err != nil {
+			return nil, err
+		}
+
+		// fix the query
+		res = dsq.ResultsReplaceQuery(res, q)
+
+		// Remove the prefix, S3 has already handled it.
+		naiveQuery := q
+		naiveQuery.Prefix = ""
+
+		// Apply the rest of the query
+		return dsq.NaiveQueryApply(naiveQuery, res), nil
 	}
 
-	// S3 store a "/foo" key as "foo" so we need to trim the leading "/"
-	q.Prefix = strings.TrimPrefix(q.Prefix, "/")
+	// Normalize the path and strip the leading / as S3 stores values
+	// without the leading /.
+	prefix := ds.NewKey(q.Prefix).String()[1:]
 
-	limit := q.Limit + q.Offset
-	if limit == 0 || limit > listMax {
-		limit = listMax
+	sent := 0
+	queryLimit := func() int64 {
+		if q.Limit > 0 && (q.Limit-sent) < listMax {
+			return int64(q.Limit - sent)
+		}
+		return listMax
 	}
 
-	resp, err := s.S3.ListObjectsV2WithContext(ctx, &s3.ListObjectsV2Input{
-		Bucket:  aws.String(s.Bucket),
-		Prefix:  aws.String(s.s3Path(q.Prefix)),
-		MaxKeys: aws.Int64(int64(limit)),
+	resp, err := s.S3.ListObjectsV2(&s3.ListObjectsV2Input{
+		Bucket:    aws.String(s.Bucket),
+		Prefix:    aws.String(s.s3Path(prefix)),
+		Delimiter: aws.String("/"),
+		MaxKeys:   aws.Int64(queryLimit()),
 	})
 	if err != nil {
 		return nil, err
@@ -195,6 +235,11 @@ func (s *S3Bucket) Query(ctx context.Context, q dsq.Query) (dsq.Results, error) 
 
 	index := q.Offset
 	nextValue := func() (dsq.Result, bool) {
+	tryAgain:
+		if q.Limit > 0 && sent >= q.Limit {
+			return dsq.Result{}, false
+		}
+
 		for index >= len(resp.Contents) {
 			if !*resp.IsTruncated {
 				return dsq.Result{}, false
@@ -202,11 +247,11 @@ func (s *S3Bucket) Query(ctx context.Context, q dsq.Query) (dsq.Results, error) 
 
 			index -= len(resp.Contents)
 
-			resp, err = s.S3.ListObjectsV2WithContext(ctx, &s3.ListObjectsV2Input{
+			resp, err = s.S3.ListObjectsV2(&s3.ListObjectsV2Input{
 				Bucket:            aws.String(s.Bucket),
-				Prefix:            aws.String(s.s3Path(q.Prefix)),
+				Prefix:            aws.String(s.s3Path(prefix)),
 				Delimiter:         aws.String("/"),
-				MaxKeys:           aws.Int64(listMax),
+				MaxKeys:           aws.Int64(queryLimit()),
 				ContinuationToken: resp.NextContinuationToken,
 			})
 			if err != nil {
@@ -219,14 +264,25 @@ func (s *S3Bucket) Query(ctx context.Context, q dsq.Query) (dsq.Results, error) 
 			Size: int(*resp.Contents[index].Size),
 		}
 		if !q.KeysOnly {
-			value, err := s.Get(ctx, ds.NewKey(entry.Key))
-			if err != nil {
-				return dsq.Result{Error: err}, false
+			value, err := s.Get(ds.NewKey(entry.Key))
+			switch err {
+			case nil:
+			case ds.ErrNotFound:
+				// This just means the value got deleted in the
+				// mean-time. That's not an error.
+				//
+				// We could use a loop instead of a goto, but
+				// this is one of those rare cases where a goto
+				// is easier to understand.
+				goto tryAgain
+			default:
+				return dsq.Result{Entry: entry, Error: err}, false
 			}
 			entry.Value = value
 		}
 
 		index++
+		sent++
 		return dsq.Result{Entry: entry}, true
 	}
 
@@ -238,7 +294,7 @@ func (s *S3Bucket) Query(ctx context.Context, q dsq.Query) (dsq.Results, error) 
 	}), nil
 }
 
-func (s *S3Bucket) Batch(_ context.Context) (ds.Batch, error) {
+func (s *S3Bucket) Batch() (ds.Batch, error) {
 	return &s3Batch{
 		s:          s,
 		ops:        make(map[string]batchOp),
@@ -270,7 +326,7 @@ type batchOp struct {
 	delete bool
 }
 
-func (b *s3Batch) Put(ctx context.Context, k ds.Key, val []byte) error {
+func (b *s3Batch) Put(k ds.Key, val []byte) error {
 	b.ops[k.String()] = batchOp{
 		val:    val,
 		delete: false,
@@ -278,7 +334,7 @@ func (b *s3Batch) Put(ctx context.Context, k ds.Key, val []byte) error {
 	return nil
 }
 
-func (b *s3Batch) Delete(ctx context.Context, k ds.Key) error {
+func (b *s3Batch) Delete(k ds.Key) error {
 	b.ops[k.String()] = batchOp{
 		val:    nil,
 		delete: true,
@@ -286,7 +342,7 @@ func (b *s3Batch) Delete(ctx context.Context, k ds.Key) error {
 	return nil
 }
 
-func (b *s3Batch) Commit(ctx context.Context) error {
+func (b *s3Batch) Commit() error {
 	var (
 		deleteObjs []*s3.ObjectIdentifier
 		putKeys    []ds.Key
@@ -322,7 +378,7 @@ func (b *s3Batch) Commit(ctx context.Context) error {
 	}
 
 	for _, k := range putKeys {
-		jobs <- b.newPutJob(ctx, k, b.ops[k.String()].val)
+		jobs <- b.newPutJob(k, b.ops[k.String()].val)
 	}
 
 	if len(deleteObjs) > 0 {
@@ -332,7 +388,7 @@ func (b *s3Batch) Commit(ctx context.Context) error {
 				limit = len(deleteObjs[i:])
 			}
 
-			jobs <- b.newDeleteJob(ctx, deleteObjs[i:i+limit])
+			jobs <- b.newDeleteJob(deleteObjs[i : i+limit])
 		}
 	}
 	close(jobs)
@@ -351,15 +407,15 @@ func (b *s3Batch) Commit(ctx context.Context) error {
 	return nil
 }
 
-func (b *s3Batch) newPutJob(ctx context.Context, k ds.Key, value []byte) func() error {
+func (b *s3Batch) newPutJob(k ds.Key, value []byte) func() error {
 	return func() error {
-		return b.s.Put(ctx, k, value)
+		return b.s.Put(k, value)
 	}
 }
 
-func (b *s3Batch) newDeleteJob(ctx context.Context, objs []*s3.ObjectIdentifier) func() error {
+func (b *s3Batch) newDeleteJob(objs []*s3.ObjectIdentifier) func() error {
 	return func() error {
-		resp, err := b.s.S3.DeleteObjectsWithContext(ctx, &s3.DeleteObjectsInput{
+		resp, err := b.s.S3.DeleteObjects(&s3.DeleteObjectsInput{
 			Bucket: aws.String(b.s.Bucket),
 			Delete: &s3.Delete{
 				Objects: objs,
