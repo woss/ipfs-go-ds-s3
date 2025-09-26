@@ -12,21 +12,21 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
-	"github.com/aws/aws-sdk-go/service/sts"
-
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/credentials/ec2rolecreds"
 	"github.com/aws/aws-sdk-go/aws/credentials/endpointcreds"
+	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
 	"github.com/aws/aws-sdk-go/aws/defaults"
 	"github.com/aws/aws-sdk-go/aws/ec2metadata"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3iface"
+	"github.com/aws/aws-sdk-go/service/sts"
 	ds "github.com/ipfs/go-datastore"
 	dsq "github.com/ipfs/go-datastore/query"
+	logging "github.com/ipfs/go-log/v2"
 )
 
 const (
@@ -45,7 +45,10 @@ const (
 	credsRefreshWindow = 2 * time.Minute
 )
 
-var _ ds.Datastore = (*S3Bucket)(nil)
+var (
+	_   ds.Datastore = (*S3Bucket)(nil)
+	log              = logging.Logger("godss3")
+)
 
 type S3Bucket struct {
 	Config
@@ -65,6 +68,18 @@ type Config struct {
 }
 
 func NewS3Datastore(conf Config) (*S3Bucket, error) {
+	logConfig := conf
+	if logConfig.AccessKey != "" {
+		logConfig.AccessKey = "[redacted]"
+	}
+	if logConfig.SecretKey != "" {
+		logConfig.SecretKey = "[redacted]"
+	}
+	if logConfig.SessionToken != "" {
+		logConfig.SessionToken = "[redacted]"
+	}
+	log.Infof("creating new S3 datastore with config: %+v", logConfig)
+
 	if conf.Workers == 0 {
 		conf.Workers = defaultWorkers
 	}
@@ -121,11 +136,15 @@ func NewS3Datastore(conf Config) (*S3Bucket, error) {
 }
 
 func (s *S3Bucket) Put(ctx context.Context, k ds.Key, value []byte) error {
+	log.Debugf("put: %s", k)
 	_, err := s.S3.PutObjectWithContext(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(s.Bucket),
 		Key:    aws.String(s.s3Path(k.String())),
 		Body:   bytes.NewReader(value),
 	})
+	if err != nil {
+		log.Errorf("put error on key %s: %v", k, err)
+	}
 	return err
 }
 
@@ -134,14 +153,17 @@ func (s *S3Bucket) Sync(ctx context.Context, prefix ds.Key) error {
 }
 
 func (s *S3Bucket) Get(ctx context.Context, k ds.Key) ([]byte, error) {
+	log.Debugf("get: %s", k)
 	resp, err := s.S3.GetObjectWithContext(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.Bucket),
 		Key:    aws.String(s.s3Path(k.String())),
 	})
 	if err != nil {
 		if isNotFound(err) {
+			log.Debugf("get: %s not found", k)
 			return nil, ds.ErrNotFound
 		}
+		log.Errorf("get error on key %s: %v", k, err)
 		return nil, err
 	}
 	defer resp.Body.Close()
@@ -150,6 +172,7 @@ func (s *S3Bucket) Get(ctx context.Context, k ds.Key) ([]byte, error) {
 }
 
 func (s *S3Bucket) Has(ctx context.Context, k ds.Key) (exists bool, err error) {
+	log.Debugf("has: %s", k)
 	_, err = s.GetSize(ctx, k)
 	if err != nil {
 		if errors.Is(err, ds.ErrNotFound) {
@@ -161,34 +184,44 @@ func (s *S3Bucket) Has(ctx context.Context, k ds.Key) (exists bool, err error) {
 }
 
 func (s *S3Bucket) GetSize(ctx context.Context, k ds.Key) (size int, err error) {
+	log.Debugf("get size: %s", k)
 	resp, err := s.S3.HeadObjectWithContext(ctx, &s3.HeadObjectInput{
 		Bucket: aws.String(s.Bucket),
 		Key:    aws.String(s.s3Path(k.String())),
 	})
 	if err != nil {
 		if s3Err, ok := err.(awserr.Error); ok && s3Err.Code() == "NotFound" {
+			log.Debugf("get size: %s not found", k)
 			return -1, ds.ErrNotFound
 		}
+		log.Errorf("get size error on key %s: %v", k, err)
 		return -1, err
 	}
 	return int(aws.Int64Value(resp.ContentLength)), nil
 }
 
 func (s *S3Bucket) Delete(ctx context.Context, k ds.Key) error {
+	log.Debugf("delete: %s", k)
 	_, err := s.S3.DeleteObjectWithContext(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(s.Bucket),
 		Key:    aws.String(s.s3Path(k.String())),
 	})
 	if isNotFound(err) {
 		// delete is idempotent
+		log.Debugf("delete: %s not found, idempotent", k)
 		err = nil
+	} else if err != nil {
+		log.Errorf("delete error on key %s: %v", k, err)
 	}
 	return err
 }
 
 func (s *S3Bucket) Query(ctx context.Context, q dsq.Query) (dsq.Results, error) {
+	log.Debugf("query: %+v", q)
 	if q.Orders != nil || q.Filters != nil {
-		return nil, fmt.Errorf("s3ds: filters or orders are not supported")
+		err := fmt.Errorf("s3ds: filters or orders are not supported")
+		log.Error(err)
+		return nil, err
 	}
 
 	listInput := &s3.ListObjectsV2Input{
@@ -211,8 +244,10 @@ func (s *S3Bucket) Query(ctx context.Context, q dsq.Query) (dsq.Results, error) 
 	nextValue := func() (dsq.Result, bool) {
 		// Initial fetch on first call
 		if !started {
+			log.Debugf("query: initial list call for prefix %s", q.Prefix)
 			resp, err = s.S3.ListObjectsV2WithContext(ctx, listInput)
 			if err != nil {
+				log.Errorf("query: list objects error: %v", err)
 				return dsq.Result{Error: err}, false
 			}
 			started = true
@@ -227,13 +262,16 @@ func (s *S3Bucket) Query(ctx context.Context, q dsq.Query) (dsq.Results, error) 
 			// Do we need to fetch the next page of results?
 			for index >= len(resp.Contents) {
 				if !aws.BoolValue(resp.IsTruncated) {
+					log.Debug("query: end of results")
 					return dsq.Result{}, false
 				}
 
 				index = 0
 				listInput.ContinuationToken = resp.NextContinuationToken
+				log.Debugf("query: fetching next page with token %s", *resp.NextContinuationToken)
 				resp, err = s.S3.ListObjectsV2WithContext(ctx, listInput)
 				if err != nil {
+					log.Errorf("query: list objects error on next page: %v", err)
 					return dsq.Result{Error: err}, false
 				}
 			}
@@ -282,6 +320,7 @@ func (s *S3Bucket) Query(ctx context.Context, q dsq.Query) (dsq.Results, error) 
 }
 
 func (s *S3Bucket) Batch(_ context.Context) (ds.Batch, error) {
+	log.Debug("starting batch")
 	return &s3Batch{
 		s:          s,
 		ops:        make(map[string]batchOp),
@@ -314,6 +353,7 @@ type batchOp struct {
 }
 
 func (b *s3Batch) Put(ctx context.Context, k ds.Key, val []byte) error {
+	log.Debugf("batch put: %s", k)
 	b.ops[k.String()] = batchOp{
 		val:    val,
 		delete: false,
@@ -322,6 +362,7 @@ func (b *s3Batch) Put(ctx context.Context, k ds.Key, val []byte) error {
 }
 
 func (b *s3Batch) Delete(ctx context.Context, k ds.Key) error {
+	log.Debugf("batch delete: %s", k)
 	b.ops[k.String()] = batchOp{
 		val:    nil,
 		delete: true,
@@ -330,6 +371,7 @@ func (b *s3Batch) Delete(ctx context.Context, k ds.Key) error {
 }
 
 func (b *s3Batch) Commit(ctx context.Context) error {
+	log.Debugf("committing batch with %d operations", len(b.ops))
 	var (
 		deleteObjs []*s3.ObjectIdentifier
 		putKeys    []ds.Key
@@ -343,6 +385,8 @@ func (b *s3Batch) Commit(ctx context.Context) error {
 			putKeys = append(putKeys, ds.NewKey(k))
 		}
 	}
+
+	log.Debugf("batch commit: %d puts, %d deletes", len(putKeys), len(deleteObjs))
 
 	numJobs := len(putKeys) + (len(deleteObjs) / deleteMax)
 	if len(deleteObjs)%deleteMax > 0 {
@@ -391,9 +435,12 @@ func (b *s3Batch) Commit(ctx context.Context) error {
 		}
 	}
 	if len(errs) > 0 {
-		return fmt.Errorf("s3ds: failed batch operation:\n%s", strings.Join(errs, "\n"))
+		err := fmt.Errorf("s3ds: failed batch operation:\n%s", strings.Join(errs, "\n"))
+		log.Error(err)
+		return err
 	}
 
+	log.Debug("batch commit successful")
 	return nil
 }
 
@@ -405,6 +452,7 @@ func (b *s3Batch) newPutJob(ctx context.Context, k ds.Key, value []byte) func() 
 
 func (b *s3Batch) newDeleteJob(ctx context.Context, objs []*s3.ObjectIdentifier) func() error {
 	return func() error {
+		log.Debugf("batch worker: deleting %d objects", len(objs))
 		resp, err := b.s.S3.DeleteObjectsWithContext(ctx, &s3.DeleteObjectsInput{
 			Bucket: aws.String(b.s.Bucket),
 			Delete: &s3.Delete{
@@ -412,6 +460,7 @@ func (b *s3Batch) newDeleteJob(ctx context.Context, objs []*s3.ObjectIdentifier)
 			},
 		})
 		if err != nil && !isNotFound(err) {
+			log.Errorf("batch worker: error deleting objects: %v", err)
 			return err
 		}
 
@@ -425,7 +474,9 @@ func (b *s3Batch) newDeleteJob(ctx context.Context, objs []*s3.ObjectIdentifier)
 		}
 
 		if len(errs) > 0 {
-			return fmt.Errorf("failed to delete objects: %s", errs)
+			err := fmt.Errorf("failed to delete objects: %s", errs)
+			log.Error(err)
+			return err
 		}
 
 		return nil
