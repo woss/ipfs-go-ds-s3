@@ -26,7 +26,7 @@ func TestSuiteLocalS3(t *testing.T) {
 	// To run tests locally, run `docker-compose up` in this repo in order to get a local S3 running
 	// on port 9000. Then run `LOCAL_S3=true go test -v ./...` to execute tests.
 	if _, localS3 := os.LookupEnv("LOCAL_S3"); !localS3 {
-		t.Skipf("skipping test suit; LOCAL_S3 is not set.")
+		t.Skipf("skipping test suite; LOCAL_S3 is not set.")
 	}
 
 	config := Config{

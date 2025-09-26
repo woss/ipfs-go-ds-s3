@@ -70,13 +70,13 @@ type Config struct {
 func NewS3Datastore(conf Config) (*S3Bucket, error) {
 	logConfig := conf
 	if logConfig.AccessKey != "" {
-		logConfig.AccessKey = "[redacted]"
+		logConfig.AccessKey = ""
 	}
 	if logConfig.SecretKey != "" {
-		logConfig.SecretKey = "[redacted]"
+		logConfig.SecretKey = ""
 	}
 	if logConfig.SessionToken != "" {
-		logConfig.SessionToken = "[redacted]"
+		logConfig.SessionToken = ""
 	}
 	log.Infof("creating new S3 datastore with config: %+v", logConfig)
 
