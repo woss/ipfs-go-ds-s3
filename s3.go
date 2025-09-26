@@ -17,7 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/credentials/ec2rolecreds"
+	"github.comcom/aws/aws-sdk-go/aws/credentials/ec2rolecreds"
 	"github.com/aws/aws-sdk-go/aws/credentials/endpointcreds"
 	"github.com/aws/aws-sdk-go/aws/defaults"
 	"github.com/aws/aws-sdk-go/aws/ec2metadata"
@@ -170,7 +170,7 @@ func (s *S3Bucket) GetSize(ctx context.Context, k ds.Key) (size int, err error) 
 		}
 		return -1, err
 	}
-	return int(*resp.ContentLength), nil
+	return int(aws.Int64Value(resp.ContentLength)), nil
 }
 
 func (s *S3Bucket) Delete(ctx context.Context, k ds.Key) error {
@@ -190,51 +190,40 @@ func (s *S3Bucket) Query(ctx context.Context, q dsq.Query) (dsq.Results, error) 
 		return nil, fmt.Errorf("s3ds: filters or orders are not supported")
 	}
 
-	// S3 store a "/foo" key as "foo" so we need to trim the leading "/"
-	q.Prefix = strings.TrimPrefix(q.Prefix, "/")
-
-	limit := q.Limit + q.Offset
-	if limit == 0 || limit > listMax {
-		limit = listMax
-	}
-
-	resp, err := s.S3.ListObjectsV2WithContext(ctx, &s3.ListObjectsV2Input{
+	listInput := &s3.ListObjectsV2Input{
 		Bucket:  aws.String(s.Bucket),
 		Prefix:  aws.String(s.s3Path(q.Prefix)),
-		MaxKeys: aws.Int64(int64(limit)),
-	})
+		MaxKeys: aws.Int64(listMax),
+	}
+
+	resp, err := s.S3.ListObjectsV2WithContext(ctx, listInput)
 	if err != nil {
 		return nil, err
 	}
 
-	index := q.Offset
+	index := 0
 	nextValue := func() (dsq.Result, bool) {
 		for index >= len(resp.Contents) {
-			if !*resp.IsTruncated {
+			if !aws.BoolValue(resp.IsTruncated) {
 				return dsq.Result{}, false
 			}
 
-			index -= len(resp.Contents)
+			index = 0
 
-			resp, err = s.S3.ListObjectsV2WithContext(ctx, &s3.ListObjectsV2Input{
-				Bucket:            aws.String(s.Bucket),
-				Prefix:            aws.String(s.s3Path(q.Prefix)),
-				Delimiter:         aws.String("/"),
-				MaxKeys:           aws.Int64(listMax),
-				ContinuationToken: resp.NextContinuationToken,
-			})
+			listInput.ContinuationToken = resp.NextContinuationToken
+			resp, err = s.S3.ListObjectsV2WithContext(ctx, listInput)
 			if err != nil {
 				return dsq.Result{Error: err}, false
 			}
 		}
 
-		keyFromS3 := *resp.Contents[index].Key
+		keyFromS3 := aws.StringValue(resp.Contents[index].Key)
 		dsKeyPath := strings.TrimPrefix(keyFromS3, s.RootDirectory)
 		dsKeyPath = strings.TrimPrefix(dsKeyPath, "/")
 
 		entry := dsq.Entry{
 			Key:  ds.NewKey(dsKeyPath).String(),
-			Size: int(*resp.Contents[index].Size),
+			Size: int(aws.Int64Value(resp.Contents[index].Size)),
 		}
 		if !q.KeysOnly {
 			value, err := s.Get(ctx, ds.NewKey(entry.Key))

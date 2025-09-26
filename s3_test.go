@@ -322,6 +322,46 @@ func TestQueryPagination(t *testing.T) {
 	}
 }
 
+func TestQueryWithOffset(t *testing.T) {
+	s3ds, mockS3 := newMockS3Datastore(t)
+	mockS3.listPageSize = 5
+
+	for i := 0; i < 15; i++ {
+		key := fmt.Sprintf("key/%02d", i)
+		err := s3ds.Put(context.Background(), ds.NewKey(key), []byte(fmt.Sprintf("value-%d", i)))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	q := dsq.Query{Prefix: "/key/", Offset: 7, Limit: 5}
+	results, err := s3ds.Query(context.Background(), q)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := results.Rest()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(entries) != 5 {
+		t.Fatalf("expected 5 entries, got %d", len(entries))
+	}
+
+	for i, entry := range entries {
+		expectedIdx := i + 7
+		expectedKey := fmt.Sprintf("/key/%02d", expectedIdx)
+		if entry.Key != expectedKey {
+			t.Errorf("unexpected key at index %d: got %s, want %s", i, entry.Key, expectedKey)
+		}
+		expectedValue := fmt.Sprintf("value-%d", expectedIdx)
+		if string(entry.Value) != expectedValue {
+			t.Errorf("unexpected value for key %s: got %s, want %s", entry.Key, string(entry.Value), expectedValue)
+		}
+	}
+}
+
 func TestGetError(t *testing.T) {
 	s3ds, mockS3 := newMockS3Datastore(t)
 	mockS3.failGet = awserr.New("InternalError", "something broke", nil)
