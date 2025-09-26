@@ -3,6 +3,7 @@ package s3ds
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -17,7 +18,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.comcom/aws/aws-sdk-go/aws/credentials/ec2rolecreds"
+	"github.com/aws/aws-sdk-go/aws/credentials/ec2rolecreds"
 	"github.com/aws/aws-sdk-go/aws/credentials/endpointcreds"
 	"github.com/aws/aws-sdk-go/aws/defaults"
 	"github.com/aws/aws-sdk-go/aws/ec2metadata"
@@ -151,7 +152,7 @@ func (s *S3Bucket) Get(ctx context.Context, k ds.Key) ([]byte, error) {
 func (s *S3Bucket) Has(ctx context.Context, k ds.Key) (exists bool, err error) {
 	_, err = s.GetSize(ctx, k)
 	if err != nil {
-		if err == ds.ErrNotFound {
+		if errors.Is(err, ds.ErrNotFound) {
 			return false, nil
 		}
 		return false, err
