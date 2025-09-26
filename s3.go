@@ -197,48 +197,85 @@ func (s *S3Bucket) Query(ctx context.Context, q dsq.Query) (dsq.Results, error) 
 		MaxKeys: aws.Int64(listMax),
 	}
 
-	resp, err := s.S3.ListObjectsV2WithContext(ctx, listInput)
-	if err != nil {
-		return nil, err
-	}
+	// The iterator needs to be stateful across Next() calls.
+	// The closure will capture these state variables.
+	var (
+		resp    *s3.ListObjectsV2Output
+		err     error
+		index   = 0
+		started = false
+		skipped = 0
+		yielded = 0
+	)
 
-	index := 0
 	nextValue := func() (dsq.Result, bool) {
-		for index >= len(resp.Contents) {
-			if !aws.BoolValue(resp.IsTruncated) {
-				return dsq.Result{}, false
-			}
-
-			index = 0
-
-			listInput.ContinuationToken = resp.NextContinuationToken
+		// Initial fetch on first call
+		if !started {
 			resp, err = s.S3.ListObjectsV2WithContext(ctx, listInput)
 			if err != nil {
 				return dsq.Result{Error: err}, false
 			}
+			started = true
 		}
 
-		keyFromS3 := aws.StringValue(resp.Contents[index].Key)
-		dsKeyPath := strings.TrimPrefix(keyFromS3, s.RootDirectory)
-		dsKeyPath = strings.TrimPrefix(dsKeyPath, "/")
-
-		entry := dsq.Entry{
-			Key:  ds.NewKey(dsKeyPath).String(),
-			Size: int(aws.Int64Value(resp.Contents[index].Size)),
-		}
-		if !q.KeysOnly {
-			value, err := s.Get(ctx, ds.NewKey(entry.Key))
-			if err != nil {
-				return dsq.Result{Error: err}, false
+		for {
+			// Have we yielded enough results according to limit?
+			if q.Limit > 0 && yielded >= q.Limit {
+				return dsq.Result{}, false
 			}
-			entry.Value = value
-		}
 
-		index++
-		return dsq.Result{Entry: entry}, true
+			// Do we need to fetch the next page of results?
+			for index >= len(resp.Contents) {
+				if !aws.BoolValue(resp.IsTruncated) {
+					return dsq.Result{}, false
+				}
+
+				index = 0
+				listInput.ContinuationToken = resp.NextContinuationToken
+				resp, err = s.S3.ListObjectsV2WithContext(ctx, listInput)
+				if err != nil {
+					return dsq.Result{Error: err}, false
+				}
+			}
+
+			// Have we skipped enough results according to offset?
+			if skipped < q.Offset {
+				skipped++
+				index++
+				continue
+			}
+
+			// If we are here, we have an entry to return.
+			keyFromS3 := aws.StringValue(resp.Contents[index].Key)
+			dsKeyPath := strings.TrimPrefix(keyFromS3, s.RootDirectory)
+			dsKeyPath = strings.TrimPrefix(dsKeyPath, "/")
+
+			entry := dsq.Entry{
+				Key:  ds.NewKey(dsKeyPath).String(),
+				Size: int(aws.Int64Value(resp.Contents[index].Size)),
+			}
+			if !q.KeysOnly {
+				value, getErr := s.Get(ctx, ds.NewKey(entry.Key))
+				if getErr != nil {
+					return dsq.Result{Error: getErr}, false
+				}
+				entry.Value = value
+			}
+
+			index++
+			yielded++
+			return dsq.Result{Entry: entry}, true
+		}
 	}
 
-	return dsq.ResultsFromIterator(q, dsq.Iterator{
+	// We are handling offset and limit in our iterator.
+	// We create a new query object for ResultsFromIterator to avoid it also
+	// trying to apply them.
+	cleanQuery := q
+	cleanQuery.Offset = 0
+	cleanQuery.Limit = 0
+
+	return dsq.ResultsFromIterator(cleanQuery, dsq.Iterator{
 		Close: func() error { return nil },
 		Next:  nextValue,
 	}), nil
