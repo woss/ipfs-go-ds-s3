@@ -22,7 +22,8 @@ import (
 	"github.com/aws/aws-sdk-go/aws/defaults"
 	"github.com/aws/aws-sdk-go/aws/ec2metadata"
 	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
+	"github.comcom/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go/service/s3/s3iface"
 	ds "github.com/ipfs/go-datastore"
 	dsq "github.com/ipfs/go-datastore/query"
 )
@@ -47,7 +48,7 @@ var _ ds.Datastore = (*S3Bucket)(nil)
 
 type S3Bucket struct {
 	Config
-	S3 *s3.S3
+	S3 s3iface.S3API
 }
 
 type Config struct {
@@ -227,8 +228,12 @@ func (s *S3Bucket) Query(ctx context.Context, q dsq.Query) (dsq.Results, error) 
 			}
 		}
 
+		keyFromS3 := *resp.Contents[index].Key
+		dsKeyPath := strings.TrimPrefix(keyFromS3, s.RootDirectory)
+		dsKeyPath = strings.TrimPrefix(dsKeyPath, "/")
+
 		entry := dsq.Entry{
-			Key:  ds.NewKey(*resp.Contents[index].Key).String(),
+			Key:  ds.NewKey(dsKeyPath).String(),
 			Size: int(*resp.Contents[index].Size),
 		}
 		if !q.KeysOnly {
@@ -262,7 +267,7 @@ func (s *S3Bucket) Close() error {
 }
 
 func (s *S3Bucket) s3Path(p string) string {
-	return path.Join(s.RootDirectory, p)
+	return path.Join(s.RootDirectory, strings.TrimPrefix(p, "/"))
 }
 
 func isNotFound(err error) bool {
@@ -305,7 +310,7 @@ func (b *s3Batch) Commit(ctx context.Context) error {
 	for k, op := range b.ops {
 		if op.delete {
 			deleteObjs = append(deleteObjs, &s3.ObjectIdentifier{
-				Key: aws.String(k),
+				Key: aws.String(b.s.s3Path(k)),
 			})
 		} else {
 			putKeys = append(putKeys, ds.NewKey(k))
@@ -313,6 +318,9 @@ func (b *s3Batch) Commit(ctx context.Context) error {
 	}
 
 	numJobs := len(putKeys) + (len(deleteObjs) / deleteMax)
+	if len(deleteObjs)%deleteMax > 0 {
+		numJobs++
+	}
 	jobs := make(chan func() error, numJobs)
 	results := make(chan error, numJobs)
 
