@@ -243,6 +243,9 @@ func TestBatching(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = b.Delete(context.Background(), ds.NewKey("key4")) // put then delete
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	err = b.Commit(context.Background())
 	if err != nil {

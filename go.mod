@@ -5,6 +5,7 @@ go 1.25
 require (
 	github.com/aws/aws-sdk-go v1.55.6
 	github.com/ipfs/go-datastore v0.8.3
+	github.com/ipfs/go-log/v2 v2.8.1
 	github.com/ipfs/kubo v0.37.0
 )
 
@@ -68,7 +69,6 @@ require (
 	github.com/ipfs/go-ipld-cbor v0.2.1 // indirect
 	github.com/ipfs/go-ipld-format v0.6.2 // indirect
 	github.com/ipfs/go-ipld-legacy v0.2.2 // indirect
-	github.com/ipfs/go-log/v2 v2.8.1 // indirect
 	github.com/ipfs/go-metrics-interface v0.3.0 // indirect
 	github.com/ipfs/go-peertaskqueue v0.8.2 // indirect
 	github.com/ipfs/go-unixfsnode v1.10.1 // indirect
